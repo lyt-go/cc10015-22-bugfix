@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.metric_def import MetricDefService
+from app.store import TransactionError
 
 router = APIRouter(prefix="/api/metric_def", tags=["指标定义"])
 
@@ -63,6 +64,15 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="metric_def.csv"'})
+
+
+@router.get("/chart-handoff/{chart_id}")
+def read_chart_snapshot(chart_id: int) -> dict[str, Any]:
+    """V022：读取可视化配置转交的图表数据快照，核对指标标识与横纵轴统计粒度。"""
+    try:
+        return service.read_chart_snapshot(chart_id)
+    except TransactionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{entry_id}", response_model=dict)

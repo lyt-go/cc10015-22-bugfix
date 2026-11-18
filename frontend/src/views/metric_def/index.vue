@@ -18,6 +18,15 @@
       </article>
     </div>
 
+    <form class="filter-bar" @submit.prevent="handoffChart">
+      <label class="filter-item">
+        <span>V022 图表快照核对（输入图表id）</span>
+        <input v-model="chartIdInput" data-testid="handoff-chart-id" placeholder="如 1" inputmode="numeric" />
+      </label>
+      <button class="btn primary" data-testid="handoff-query" type="submit">读取图表数据快照</button>
+      <span v-if="handoffMessage" data-testid="handoff-message" :class="handoffOk ? 'stat-label' : 'error-text'">{{ handoffMessage }}</span>
+    </form>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -100,6 +109,9 @@ const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const chartIdInput = ref('1')
+const handoffMessage = ref('')
+const handoffOk = ref(false)
 const stats = computed(() => [
   { label: metricNames[0], value: total.value },
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
@@ -109,6 +121,25 @@ const stats = computed(() => [
 function resetFilters() {
   filters.value = {}
   void reload()
+}
+
+async function handoffChart() {
+  handoffMessage.value = ''
+  handoffOk.value = false
+  const chartId = Number(chartIdInput.value)
+  if (!Number.isInteger(chartId) || chartId <= 0) {
+    handoffMessage.value = '请输入有效的图表id'
+    return
+  }
+  try {
+    const response = await request(`${ENDPOINT}/chart-handoff/${chartId}`)
+    const payload = await response.json()
+    if (!response.ok) throw new Error(payload.detail || '图表快照读取失败')
+    handoffOk.value = Boolean(payload['粒度校验通过'])
+    handoffMessage.value = `${payload.message}：指标 ${payload['指标标识']}，横轴 ${payload['横轴统计粒度']} / 纵轴 ${payload['纵轴统计粒度']}（${payload['留档版本']}）`
+  } catch (error) {
+    handoffMessage.value = error instanceof Error ? error.message : '图表快照读取失败'
+  }
 }
 
 async function exportRows() {

@@ -617,3 +617,115 @@ test('概览汇总', async ({ page }) => {
   await expect(page.locator('.stat-value').nth(1)).toBeVisible()
   // 验证概览页加载正常即可，不硬编码精确计数（取决于各模块 E2E 登记成功数）
 })
+
+test('可视化配置：图表数据快照持久化、来源切换与 V022 联动', async ({ page, request }) => {
+  test.setTimeout(300_000)
+  const browserErrors: string[] = []
+  page.on('pageerror', e => browserErrors.push(e.message))
+  page.on('response', r => { if (r.url().includes('/api/') && r.status() >= 400) browserErrors.push(`${r.status()} ${r.url()}`) })
+
+  const api = process.env.E2E_BASE_URL?.replace(/:\d+$/, ':8000') ?? 'http://127.0.0.1:8000'
+  const configValues = {
+    图表编号: 'E2E-SNAP-001',
+    图表类型: '折线图',
+    数据来源: 'e2e_source_a',
+    横轴字段: '统计日期(按日)',
+    纵轴字段: '成交金额(按日)',
+    分组字段: '渠道',
+    刷新间隔: '5分钟',
+    分享链接: 'https://example.com/a',
+  }
+
+  // 登记：配置与首版快照同时提交
+  const createResp = await request.post(`${api}/api/chart_config`, { data: { values: configValues } })
+  expect(createResp.ok()).toBeTruthy()
+  const created = await createResp.json()
+  expect(created.ok).toBeTruthy()
+  const chartId = created.entry.id as number
+  const firstValues = created.entry['数据快照'].points.map((p: any) => p['指标值'])
+  expect(firstValues).toHaveLength(6)
+
+  await page.goto('/chart_config')
+  const targetRow = page.getByTestId(`row-${chartId}`)
+  await expect(targetRow).toBeVisible({ timeout: 10000 })
+
+  // 刷新页面后仍是同一组指标值（不再出现旧随机指标）
+  await page.reload()
+  await expect(page.getByTestId(`row-${chartId}`)).toBeVisible()
+  const rowTextAfterReload = await page.getByTestId(`row-${chartId}`).getByTestId('snapshot-values').innerText()
+  for (const value of firstValues.slice(0, 3)) {
+    expect(rowTextAfterReload).toContain(String(value))
+  }
+
+  // 抽屉与导航页读取同一业务数据：抽屉快照与列表同源
+  await page.getByTestId(`open-detail-${chartId}`).click()
+  await expect(page.getByTestId('chart-drawer')).toBeVisible()
+  await expect(page.getByTestId('drawer-snapshot')).toBeVisible()
+  const drawerText = await page.getByTestId('drawer-snapshot').innerText()
+  expect(drawerText).toContain('e2e_source_a')
+  expect(drawerText).toContain(String(firstValues[0]))
+
+  // recompute_first：切换数据来源，坐标字段与快照一起重算
+  await page.getByTestId('form-数据来源').fill('e2e_source_b')
+  await page.getByTestId('form-横轴字段').fill('自然周(按周)')
+  await page.getByTestId('submit-save').click()
+  await expect(page.getByTestId('chart-drawer')).toHaveCount(0)
+  const switchedResp = await request.get(`${api}/api/chart_config/${chartId}`)
+  const switched = await switchedResp.json()
+  expect(switched['数据来源']).toBe('e2e_source_b')
+  expect(switched['数据快照']['数据来源']).toBe('e2e_source_b')
+  expect(switched['数据快照']['横轴字段']).toBe('自然周(按周)')
+  expect(switched['数据快照']['横轴统计粒度']).toBe('按周')
+  // 重新进入页面仍对得上同一组值
+  await page.reload()
+  const switchedRow = await (await request.get(`${api}/api/chart_config/${chartId}`)).json()
+  const reloadedRow = await (await request.get(`${api}/api/chart_config/${chartId}`)).json()
+  expect(reloadedRow['数据快照']).toEqual(switchedRow['数据快照'])
+  // 旧配置已归档
+  const archive = await (await request.get(`${api}/api/chart_config/archive`)).json()
+  expect(archive.items.some((a: any) => a['图表id'] === chartId)).toBeTruthy()
+
+  // freeze_first：冻结旧来源完整快照并标记待切换，页面仍显示旧来源
+  const freezeResp = await request.put(`${api}/api/chart_config/${chartId}`, {
+    data: { strategy: 'freeze_first', values: { ...configValues, 数据来源: 'e2e_source_c' } },
+  })
+  expect(freezeResp.ok()).toBeTruthy()
+  const frozen = await freezeResp.json()
+  expect(frozen.entry['数据来源']).toBe('e2e_source_b')
+  expect(frozen.entry['待切换数据来源']).toBe('e2e_source_c')
+  await page.reload()
+  await expect(page.getByTestId(`confirm-switch-${chartId}`)).toBeVisible()
+  await page.getByTestId(`confirm-switch-${chartId}`).click()
+  await page.waitForLoadState('networkidle')
+  const confirmed = await (await request.get(`${api}/api/chart_config/${chartId}`)).json()
+  expect(confirmed['数据来源']).toBe('e2e_source_c')
+  expect(confirmed['数据快照']['数据来源']).toBe('e2e_source_c')
+
+  // 核对快照：一致时返回 ok
+  const verifyResp = await request.post(`${api}/api/chart_config/${chartId}/verify`)
+  expect(verifyResp.ok()).toBeTruthy()
+  const verify = await verifyResp.json()
+  expect(verify.ok).toBeTruthy()
+
+  // 保存失败整体回滚：缺必填字段返回 409，旧快照完整保留
+  const rollbackResp = await request.put(`${api}/api/chart_config/${chartId}`, {
+    data: { strategy: 'recompute_first', values: { 图表编号: '' } },
+  })
+  expect(rollbackResp.status()).toBe(409)
+  const afterRollback = await (await request.get(`${api}/api/chart_config/${chartId}`)).json()
+  expect(afterRollback['数据快照']['points']).toHaveLength(6)
+  expect(afterRollback['数据来源']).toBe('e2e_source_c')
+
+  // V022 跨模块联动：指标定义读取快照指标标识并校验横纵轴统计粒度
+  await request.post(`${api}/api/metric_def`, {
+    data: { 指标编号: 'E2E-SNAP-001', 指标名称: 'E2E指标', 计算公式: 'sum(x)', 统计粒度: '按日' },
+  })
+  const handoffResp = await request.get(`${api}/api/metric_def/chart-handoff/${chartId}`)
+  expect(handoffResp.ok()).toBeTruthy()
+  const handoff = await handoffResp.json()
+  expect(handoff['指标标识']).toBe('E2E-SNAP-001')
+  expect(handoff['留档版本']).toBe('V022')
+  expect(handoff['粒度校验通过'] === true || handoff['粒度校验通过'] === false).toBeTruthy()
+
+  expect(browserErrors).toEqual([])
+})

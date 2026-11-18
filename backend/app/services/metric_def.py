@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.store import store
+from app.services.chart_config import ChartConfigService
+from app.store import TransactionError, store
 
 MODULE = "metric_def"
 LIST_FIELDS = ["指标编号", "指标名称", "计算公式", "统计粒度", "时间窗口", "基准取值", "精度位数", "口径版本"]
@@ -63,3 +64,40 @@ class MetricDefService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"指标定义已{action}"
+
+    def read_chart_snapshot(self, chart_id: int) -> dict[str, Any]:
+        """V022 跨模块联动：读取图表数据快照，校验指标标识与横纵轴统计粒度。
+
+        指标定义模块顺着调用链拿到可视化配置侧持久化的同一份快照，核对其中的
+        指标标识是否在指标定义表内登记，并比对指标口径的统计粒度与轴字段粒度。
+        """
+        handoff = ChartConfigService().read_snapshot_for_metric(chart_id)
+        metric_code = str(handoff.get("指标标识") or "")
+        metric_row = next(
+            (row for row in store.rows(MODULE) if str(row.get("指标编号") or "") == metric_code),
+            None,
+        )
+        if metric_row is None:
+            raise TransactionError(f"图表快照中的指标标识 {metric_code or '(空)'} 未在指标定义模块登记")
+        defined_grain = str(metric_row.get("统计粒度") or "")
+        axis_grains = {str(handoff.get("横轴统计粒度") or ""), str(handoff.get("纵轴统计粒度") or "")}
+        grain_matched = defined_grain in axis_grains or any(
+            defined_grain and defined_grain in grain for grain in axis_grains
+        )
+        return {
+            "ok": bool(grain_matched),
+            "图表id": chart_id,
+            "指标标识": metric_code,
+            "指标名称": metric_row.get("指标名称"),
+            "指标定义统计粒度": defined_grain,
+            "横轴字段": handoff.get("横轴字段"),
+            "纵轴字段": handoff.get("纵轴字段"),
+            "横轴统计粒度": handoff.get("横轴统计粒度"),
+            "纵轴统计粒度": handoff.get("纵轴统计粒度"),
+            "粒度校验通过": grain_matched,
+            "快照版本": handoff.get("快照版本"),
+            "留档版本": "V022",
+            "message": "统计粒度核对通过" if grain_matched else (
+                f"统计粒度不一致：指标定义为{defined_grain}，快照轴粒度为{'/'.join(sorted(g for g in axis_grains if g))}"
+            ),
+        }

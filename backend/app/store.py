@@ -4,10 +4,16 @@
 """
 from __future__ import annotations
 
+import copy
 import time
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from app.seed import SEED_ROWS
+
+
+class TransactionError(Exception):
+    """事务内业务校验失败时抛出，触发整笔回滚。"""
 
 
 class Store:
@@ -17,6 +23,27 @@ class Store:
         }
         self._versions: dict[str, int] = {name: 1 for name in self._tables}
         self._created_at: dict[str, float] = {name: time.time() for name in self._tables}
+        # 图表数据快照归档与跨模块留痕：键为仓库内独立表名
+        self._tables.setdefault("chart_snapshot_archive", [])
+        self._tables.setdefault("chart_snapshot_audit", [])
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """整笔提交/整体回滚的内存事务。
+
+        进入时对所有表和版本号做深拷贝；事务内任何异常都会把仓库恢复到进入前的
+        完整快照，保证「配置与快照同时提交」不会只落一半。
+        """
+        backup_tables = copy.deepcopy(self._tables)
+        backup_versions = dict(self._versions)
+        backup_created_at = dict(self._created_at)
+        try:
+            yield
+        except Exception:
+            self._tables = backup_tables
+            self._versions = backup_versions
+            self._created_at = backup_created_at
+            raise
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
